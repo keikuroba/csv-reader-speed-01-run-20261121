@@ -12,6 +12,8 @@
 //    segments only; a CR inside quotes folds to LF as the reference does;
 //  - an unclosed quote falls back to the reference's rule: the quote is a
 //    literal character and the rest is re-read as unquoted.
+//  - a field's result travels in variables, not a fresh object per field,
+//    to keep the garbage collector out of the hot loop.
 // Every error (stray_cr, quote_junk, unterminated_quote, short_row,
 // long_row) is recorded with the same {code, line, row} and in the same
 // order the reference records it; rows are padded or cut to the first
@@ -41,6 +43,14 @@ export function run(input) {
   let recordLine = 1;
   let recordRow = null;
 
+  // The last field read: its value, how it ended (COMMA, LINE_BREAK or
+  // END) and how many characters readUnquoted kept onto it. Kept in
+  // variables, not a fresh object per field, to keep the garbage collector
+  // out of the hot loop.
+  let fValue = '';
+  let fEnded = END;
+  let fAdded = 0;
+
   function error(code) {
     errors.push({ code, line: recordLine, row: recordRow });
   }
@@ -64,8 +74,8 @@ export function run(input) {
   }
 
   // Reads unquoted characters onto `value` up to the next comma or line
-  // break: a CR not followed by LF is dropped (stray_cr). Returns the field
-  // and how it ended; `added` counts the characters kept.
+  // break: a CR not followed by LF is dropped (stray_cr). Sets fValue,
+  // fEnded and fAdded; `added` counts the characters kept.
   function readUnquoted(value) {
     let added = 0;
     while (pos < len) {
@@ -99,19 +109,26 @@ export function run(input) {
       }
       value += seg;
       added += seg.length;
+      fValue = value;
+      fAdded = added;
       if (kind === COMMA) {
         pos = end + 1;
-        return { value, ended: COMMA, added };
+        fEnded = COMMA;
+        return;
       }
       if (kind === LINE_BREAK) {
         pos = end + 1;
         line += 1;
-        return { value, ended: LINE_BREAK, added };
+        fEnded = LINE_BREAK;
+        return;
       }
       pos = len;
-      return { value, ended: END, added };
+      fEnded = END;
+      return;
     }
-    return { value, ended: END, added };
+    fValue = value;
+    fEnded = END;
+    fAdded = added;
   }
 
   // One quoted segment [start, end): folds every CR or CRLF to LF and
@@ -128,7 +145,8 @@ export function run(input) {
     return s;
   }
 
-  // Reads a quoted field whose opening quote is at pos.
+  // Reads a quoted field whose opening quote is at pos. Sets fValue,
+  // fEnded and fAdded (added is only meaningful for the junk tail).
   function readQuoted() {
     const open = pos;
     const openLine = line;
@@ -142,7 +160,8 @@ export function run(input) {
         pos = open + 1;
         line = openLine;
         error('unterminated_quote');
-        return readUnquoted('"');
+        readUnquoted('"');
+        return;
       }
       if (j > start) value += foldSegment(start, j);
       if (text.charCodeAt(j + 1) === 34) {
@@ -153,27 +172,40 @@ export function run(input) {
       pos = j + 1;
       break;
     }
-    if (pos >= len) return { value, ended: END };
+    if (pos >= len) {
+      fValue = value;
+      fEnded = END;
+      fAdded = 0;
+      return;
+    }
     const c = text.charCodeAt(pos);
     if (c === 44) {
       pos += 1;
-      return { value, ended: COMMA };
+      fValue = value;
+      fEnded = COMMA;
+      fAdded = 0;
+      return;
     }
     if (c === 10) {
       pos += 1;
       line += 1;
-      return { value, ended: LINE_BREAK };
+      fValue = value;
+      fEnded = LINE_BREAK;
+      fAdded = 0;
+      return;
     }
     if (c === 13 && text.charCodeAt(pos + 1) === 10) {
       pos += 2;
       line += 1;
-      return { value, ended: LINE_BREAK };
+      fValue = value;
+      fEnded = LINE_BREAK;
+      fAdded = 0;
+      return;
     }
     // What follows the closing quote is appended as it stands, up to the
     // next comma or line break.
-    const junk = readUnquoted(value);
-    if (junk.added > 0) error('quote_junk');
-    return junk;
+    readUnquoted(value);
+    if (fAdded > 0) error('quote_junk');
   }
 
   while (true) {
@@ -225,13 +257,13 @@ export function run(input) {
 
     // General path: read the record a field at a time.
     const fields = [];
-    let field;
     let quoted;
     do {
       quoted = text.charCodeAt(pos) === 34;
-      field = quoted ? readQuoted() : readUnquoted('');
-      fields.push(field.value);
-    } while (field.ended === COMMA);
+      if (quoted) readQuoted();
+      else readUnquoted('');
+      fields.push(fValue);
+    } while (fEnded === COMMA);
 
     // A line that held only stray CRs is left with no characters: no record
     // (its stray_cr errors stay).
